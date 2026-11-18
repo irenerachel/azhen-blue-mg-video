@@ -1,0 +1,1 @@
+window.CUES = {"total": 8, "scenes": [{"key": "intro", "start": 0, "end": 4, "marks": {"compare": 2}, "light": false}, {"key": "end", "start": 4, "end": 8, "marks": {}, "light": false}], "subs": [{"t0": 0.4, "t1": 3.6, "text": "把三组数据排在一起"}], "allText": "把三组数据排在一起，就能看见差异。感谢观看，我们下期见。"};

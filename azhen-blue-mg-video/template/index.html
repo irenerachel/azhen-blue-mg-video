@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>蓝色动态图形视频</title>
+<style>
+@font-face{font-family:"LXGW WenKai";src:local("LXGW WenKai"),local("霞鹜文楷"),local("LXGW WenKai TC"),local("LXGWWenKaiTC-Regular")}
+@font-face{font-family:Fraunces;src:local("Fraunces Italic"),local("Georgia Italic");font-style:italic}
+html,body{margin:0;background:#0d0d0f;color:#eee;font-family:MiSans,sans-serif}
+body.render canvas{display:block}
+body:not(.render){display:flex;flex-direction:column;align-items:center;gap:10px;padding:12px}
+body:not(.render) canvas{max-height:calc(100vh - 90px);max-width:96vw;width:auto;height:auto;border-radius:12px}
+#bar{display:flex;gap:10px;align-items:center;width:min(600px,94vw)}
+#bar input{flex:1}
+body.render #bar{display:none}
+</style>
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="bar"><button id="play">播放</button><input id="scrub" type="range" min="0" step="0.01" value="0"><span id="tc">0.00</span></div>
+<audio id="au" src="audio/mix.wav" preload="auto"></audio>
+<script src="brand.js"></script>
+<script src="cues.js"></script>
+<script src="mouth.js"></script>
+<script src="core.js"></script>
+<script id="main">
+"use strict";
+// 蓝色动态图形引擎：时间线 / 转场 / 字幕 / 头像 / 镜头；竖版默认，?layout=h 出横版
+// 画幅：默认竖版 1080×1920；?layout=h 出横版 1920×1080（2K 输出都乘 1.333）
+const HZ = new URLSearchParams(location.search).get("layout") === "h";
+const LY = HZ
+  ? { sx: 120, rx: 1800, tx: 120, ty: 440, ts: 88, lh: 104, ey: 330, box: { x: 800, y: 150, w: 1000, h: 700 }, cam: [960, 540],
+      av: { x: 1790, y: 955, r: 96 }, cap: { x0: 120, x1: 1640, y: 975, h: 84, size: 44, min: 36 }, keep: [100, 1820, 120, 880], zoom: 0.4, follow: 0.2 }
+  : { sx: 110, rx: 970, tx: 110, ty: 400, ts: 96, lh: 112, ey: 290, box: { x: 110, y: 520, w: 860, h: 810 }, cam: [540, 900],
+      av: { x: 880, y: 1540, r: 130 }, cap: { x0: 110, x1: 720, y: 1554, h: 92, size: 48, min: 38 }, keep: null, zoom: 0.8, follow: 0.7 };
+const W = HZ ? 1920 : 1080, H = HZ ? 1080 : 1920, SX = LY.sx, RX = LY.rx, CW = RX - SX;
+const C = AK.C;
+const BASE_LIGHT = new URLSearchParams(location.search).get("theme") !== "dark";   // 默认浅色
+const AV = LY.av;
+const CAP = LY.cap;
+const FLOW = 0.9, HALF = FLOW / 2, FLOW_DY = HZ ? 300 : 520;
+const KAI = new URLSearchParams(location.search).get("font") === "kai";
+const F = {
+  head: s => `900 ${s}px MiSans, "PingFang SC", "Microsoft YaHei", sans-serif`,
+  sans: (s, w = 500) => `${w} ${s}px MiSans, "PingFang SC", "Microsoft YaHei", sans-serif`,
+  num: (s, w = 600) => `italic ${w} ${s}px Fraunces`,
+};
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const SCALE = +(new URLSearchParams(location.search).get("scale") || 1);
+cv.width = Math.round(W * SCALE); cv.height = Math.round(H * SCALE);
+
+const IMGS = {
+  bg: "assets/bg_dark.jpg", bgL: "assets/bg_light.jpg",
+  ip: "assets/ip_sticker.png", avatar: "assets/ip_face_wide.png",
+};
+const IMG = {};
+
+// ───────── 缓动 ─────────
+const cl = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, t) => a + (b - a) * t;
+const eOut = t => 1 - Math.pow(1 - cl(t), 3);
+const eOut5 = t => 1 - Math.pow(1 - cl(t), 5);
+const eIn = t => Math.pow(cl(t), 3);
+const eIO = t => { t = cl(t); return t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+const eBack = (t, k = 1.7) => { t = cl(t); const c3 = k + 1; return 1 + c3 * Math.pow(t - 1, 3) + k * Math.pow(t - 1, 2); };
+const spring = (t, f = 2.2, z = 5.5) => { t = Math.max(0, t); return 1 - Math.exp(-z * t) * Math.cos(f * Math.PI * 2 * t); };
+
+// ───────── 时间线 ─────────
+const SCN = CUES.scenes, TOTAL = CUES.total;
+const B = SCN.map(s => s.start);
+function flowP(i, t) { return cl((t - (B[i] - HALF)) / FLOW); }
+const L = (S, t) => t - S.start;
+const at = (S, k) => S.marks[k] - S.start;
+const dur = S => S.end - S.start;
+const ap = (lt, d = 0, d2 = 0.55) => eOut((lt + HALF - d) / d2);   // 入场：场景推入时就开始
+
+// ───────── 绘图工具 ─────────
+function rr(c, x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  c.beginPath(); c.moveTo(x + r, y); c.arcTo(x + w, y, x + w, y + h, r); c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r); c.arcTo(x, y, x + w, y, r); c.closePath();
+}
+function txt(c, s, x, y, font, color, align = "left", base = "middle") {
+  c.font = font; c.fillStyle = color; c.textAlign = align; c.textBaseline = base; c.fillText(s, x, y); return c.measureText(s).width;
+}
+function tw(c, s, font) { c.font = font; return c.measureText(s.replace(/[{}]/g, "")).width; }
+// 富文本：{} 内为强调色
+function rich(c, s, x, y, font, col, hi) {
+  c.font = font; c.textBaseline = "middle"; c.textAlign = "left"; let on = false;
+  for (const seg of s.split(/([{}])/)) { if (seg === "{") { on = true; continue; } if (seg === "}") { on = false; continue; } c.fillStyle = on ? hi : col; c.fillText(seg, x, y); x += c.measureText(seg).width; }
+  return x;
+}
+function theme(light) {
+  return light
+    ? { light, fg: C.ink, sub: C.muted, card: C.white, line: C.line, hi: C.acc, track: "#ECE8E0",
+        d: { amber: C.amberDeep, green: C.greenDeep, coral: "#C2577A", blue: C.blueDeep, rose: C.roseDeep } }
+    : { light, fg: "#F5F2EC", sub: C.darkMuted, card: C.darkCard, line: C.darkLine, hi: C.accMid, track: "#2C2A27",
+        d: { amber: C.amber, green: C.green, coral: C.coral, blue: C.blue, rose: C.rose } };
+}
+// 标题：左上固定，黑体 96，两行（动效库 AK.title 同一位置）
+function head(c, l1, l2, lt, th, o = {}) {
+  [l1, l2].forEach((s, i) => {
+    if (!s) return;
+    const k = ap(lt, (o.d || 0) + 0.04 + i * 0.08, 0.5);
+    c.save(); c.globalAlpha *= cl(k * 1.5); c.translate(0, (1 - k) * 36);
+    rich(c, s, SX, i ? 492 : 380, F.head(96), th.fg, th.hi);
+    c.restore();
+  });
+}
+// 卡片：白底 + 发丝线；hl 为描边强调色
+function box(c, x, y, w, h, th, o = {}) {
+  rr(c, x, y, w, h, o.r == null ? 36 : o.r); c.fillStyle = o.fill || th.card; c.fill();
+  c.lineWidth = o.hl ? 4 : 2; c.strokeStyle = o.hl || th.line; c.stroke();
+}
+// 入场包装：p 0→1，上移淡入
+function rise(c, p, dy, fn) { if (p <= 0) return; c.save(); c.globalAlpha *= cl(p * 1.4); c.translate(0, (1 - p) * dy); fn(); c.restore(); }
+// 弹出：以 (cx,cy) 为中心过冲缩放
+function pop(c, lt, t0, cx, cy, fn, k0 = 0.6) {
+  const tt = lt - t0, a = cl(tt / 0.12), s = eBack(tt / 0.45, 2);
+  if (a <= 0) return;
+  c.save(); c.globalAlpha *= a; c.translate(cx, cy); c.scale(lerp(k0, 1, s), lerp(k0, 1, s)); c.translate(-cx, -cy); fn(); c.restore();
+}
+// 插图：完整显示、圆角 18、发丝线，场景内缓慢上移
+function pic(c, img, lt, S, y, o = {}) {
+  const w = o.w || CW, x = o.x != null ? o.x : SX, h = w * img.height / img.width, p = ap(lt, o.d || 0.08, 0.6);
+  const yy = y + (1 - p) * 50 - 10 * cl(lt / Math.max(dur(S), 1));
+  c.save(); c.globalAlpha *= cl(p * 1.4);
+  if (o.cut) c.drawImage(img, x, yy, w, h);   // 透明底插图：直接放在纸底上，不加框
+  else { rr(c, x, yy, w, h, 18); c.save(); c.clip(); c.fillStyle = "#fff"; c.fill(); c.drawImage(img, x, yy, w, h); c.restore();
+    c.lineWidth = 2; c.strokeStyle = "rgba(28,26,32,0.10)"; c.stroke(); }
+  c.restore();
+  return y + h;
+}
+// 胶囊标签：浅底 + 压暗字，或描边
+function pill(c, s, x, y, th, tone, o = {}) {
+  const size = o.size || 32, f = F.sans(size, 700), w = tw(c, s, f) + size * 1.3 + (o.icon ? size * 1.2 : 0), h = size * 1.9;
+  const fill = o.solid ? C[tone] : (th.light ? C[tone + "Tint"] : "rgba(255,255,255,0.06)");
+  rr(c, x, y - h / 2, w, h, h / 2); c.fillStyle = fill; c.fill();
+  if (!o.solid) { c.lineWidth = 2; c.strokeStyle = C[tone]; c.stroke(); }   // 浅底标签加同色描边，纸底上也看得出框
+  let tx = x + size * 0.65;
+  const fg = o.solid ? "#fff" : (th.d[tone] || C.accTxt);
+  if (o.icon) { AK.ctx = c; AK.icon(o.icon, tx + size * 0.45, y, size * 0.95, fg); tx += size * 1.2; }
+  txt(c, s, tx, y + 1, f, fg);
+  return w;
+}
+function tile(c, name, x, y, s, col) { AK.ctx = c; AK.iconTile(name, x, y, s, col, "#FFFFFF"); }
+// 人民币符号块（图标库里没有）
+function yuanTile(c, x, y, s, col) { rr(c, x, y, s, s, s * .27); c.fillStyle = col; c.fill(); txt(c, "¥", x + s / 2, y + s / 2 + 2, F.head(s * .56), "#fff", "center"); }
+function note(c, s, x, y, th, align = "left") { txt(c, s, x, y, F.sans(26, 500), th.sub, align); }
+function arrowR(c, x1, x2, y, col, k = 1) {
+  if (k <= 0) return; const x = lerp(x1, x2, k);
+  c.save(); c.strokeStyle = col; c.lineWidth = 5; c.lineCap = "round"; c.lineJoin = "round";
+  c.beginPath(); c.moveTo(x1, y); c.lineTo(x, y); c.moveTo(x - 14, y - 14); c.lineTo(x, y); c.lineTo(x - 14, y + 14); c.stroke(); c.restore();
+}
+function arrowD(c, x, y1, y2, col, k = 1) {
+  if (k <= 0) return; const y = lerp(y1, y2, k);
+  c.save(); c.strokeStyle = col; c.lineWidth = 5; c.lineCap = "round"; c.lineJoin = "round";
+  c.beginPath(); c.moveTo(x, y1); c.lineTo(x, y); c.moveTo(x - 14, y - 14); c.lineTo(x, y); c.lineTo(x + 14, y - 14); c.stroke(); c.restore();
+}
+function tick(c, x, y, col, k = 1, s = 1) {
+  if (k <= 0) return;
+  c.save(); c.lineWidth = 7 * s; c.lineCap = "round"; c.lineJoin = "round"; c.strokeStyle = col; c.beginPath();
+  const p = [[x - 16 * s, y], [x - 4 * s, y + 12 * s], [x + 18 * s, y - 13 * s]], k1 = cl(k * 2), k2 = cl(k * 2 - 1);
+  c.moveTo(...p[0]); c.lineTo(lerp(p[0][0], p[1][0], k1), lerp(p[0][1], p[1][1], k1));
+  if (k2 > 0) c.lineTo(lerp(p[1][0], p[2][0], k2), lerp(p[1][1], p[2][1], k2));
+  c.stroke(); c.restore();
+}
+// 计数：从 0 数到 v
+const count = (lt, t0, v, d = 0.9) => v * eOut5((lt - t0) / d);
+function coin(c, x, y, r) {
+  c.beginPath(); c.arc(x, y, r, 0, 6.2832); c.fillStyle = C.amber; c.fill();
+  c.beginPath(); c.arc(x, y, r * 0.68, 0, 6.2832); c.lineWidth = Math.max(2, r * 0.12); c.strokeStyle = "rgba(255,255,255,0.75)"; c.stroke();
+}
+
+
+// ───────── 动态图形工具（第二版）─────────
+// 镜头：keys = [[t, 倍率, 看向x, 看向y]]，看向点放到 (540, 900)；另加极轻的手持漂移
+// 运镜：大部分时间静止；每个关键帧前 CAM_MOVE 秒内干脆地推 / 移到位，然后停住
+// 慢速蠕动时每帧位移不到 1 像素，文字会在像素之间来回对齐，看起来就是抖；所以要么静止，要么快速移动
+const CAM_MOVE = 0.6;
+function cam(c, lt, keys, bump = 0) {
+  if (!keys || !keys.length) return;
+  const pw = j => { if (lt <= keys[0][0]) return keys[0][j]; for (let i = 1; i < keys.length; i++) if (lt <= keys[i][0]) { const a = keys[i - 1], b = keys[i], d = Math.min(CAM_MOVE, b[0] - a[0] || 1); return lerp(a[j], b[j], eIO((lt - (b[0] - d)) / d)); } return keys[keys.length - 1][j]; };
+  // 定稿：镜头平时完全静止，只在每个关键帧前 CAM_MOVE 秒内干脆地移到位；不蠕动、不震、不转、没有手持漂移。bump 不生效
+  const s0 = camS(pw(1)), s = s0, [fx, fy] = camFocus(s0, pw(2), pw(3));
+  c.translate(LY.cam[0], LY.cam[1]); c.scale(s, s); c.translate(-fx, -fy);
+}
+// 推近幅度和看向点的跟随比例按画幅缩小（LY.zoom / LY.follow：竖版 0.8 / 0.7，横版 0.4 / 0.2），场景里的倍率按竖版手感写；
+// 横版的看向点再夹在 LY.keep 里，左栏标题和进度条不出画；竖版只夹左边，标题离左边至少 60px
+const camS = s => 1 + (s - 1) * LY.zoom;
+let CUR_OUT = null, CUR_DUR = 5, CUR_T = 0;   // 当前场景的标题落下时刻、时长；当前全片时刻
+function camFocus(s, fx, fy) {
+  // 看向点只往目标挪一部分
+  fx = LY.cam[0] + (fx - LY.cam[0]) * LY.follow; fy = LY.cam[1] + (fy - LY.cam[1]) * LY.follow;
+  if (!LY.keep) return [Math.min(fx, SX - 70 + W / 2 / s), fy];   // 竖版：推近时左边的标题不出画
+  const [x0, x1, y0, y1] = LY.keep, hw = W / 2 / s, hh = H / 2 / s;
+  const clampR = (v, lo, hi) => lo > hi ? (lo + hi) / 2 : Math.min(hi, Math.max(lo, v));
+  return [clampR(fx, x1 - hw, x0 + hw), clampR(fy, y1 - hh, y0 + hh)];
+}
+// 世界坐标 → 屏幕坐标（镜头停在 s, fx, fy 时）：交接常量用
+function toScreen(x, y, s, fx, fy) { s = camS(s); const [cx, cy] = camFocus(s, fx, fy); return [(x - cx) * s + LY.cam[0], (y - cy) * s + LY.cam[1]]; }
+// 标题：竖版一行；横版在 | 处断成两行，放左栏
+function TT(c, s, lt, t0, th, o = {}) {
+  const lines = HZ ? s.split("|") : [s.replace(/\|/g, "")];
+  const out = o.out != null ? o.out : CUR_OUT;   // 没写 out 的标题在本屏结尾自动逐字落下
+  t0 = Math.max(-0.38, t0 - 0.3);   // 转场过程中就开始升起，不留空屏
+  lines.forEach((ln, i) => ktitle(c, ln, LY.tx, LY.ty + i * LY.lh, LY.ts, lt, t0 + i * 0.12, th, { out: out != null ? out + i * 0.06 : undefined, bump: o.bump }));
+}
+// 逐字遮罩升起；o.out 时逐字落下退场；o.bump 时强调字弹一下
+function ktitle(c, s, x, y, size, lt, t0, th, o = {}) {
+  const f = KAI ? `500 ${size}px "LXGW WenKai"` : F.head(size); c.font = f; c.textBaseline = "middle"; c.textAlign = "left";
+  let on = false, cx = x, i = 0;
+  for (const seg of s.split(/([{}])/)) {
+    if (seg === "{") { on = true; continue; } if (seg === "}") { on = false; continue; }
+    for (const ch of seg) {
+      c.font = f; const w = c.measureText(ch).width, p = (lt - t0 - i * 0.045) / 0.55;
+      let dy = (1 - eBack(p, 1.4)) * size * 1.2, gone = false;
+      if (o.out != null) { const q = (lt - o.out - i * 0.03) / 0.35; if (q >= 1) gone = true; else if (q > 0) dy = -eIn(q) * size * 1.2; }
+      if (p > 0 && !gone) {
+        const b = o.bump != null && on ? lt - o.bump : -1, sc = b > 0 ? 1 + 0.16 * Math.exp(-6 * b) * Math.sin(Math.min(b * 12, Math.PI) ) : 1;
+        c.save(); if (p < 1 || o.out != null) { c.beginPath(); c.rect(cx - 6, y - size * 0.66, w + 12, size * 1.32); c.clip(); }
+        c.translate(cx + w / 2, y + dy); c.scale(sc, sc); c.fillStyle = on ? th.hi : th.fg; c.fillText(ch, -w / 2, 0); c.restore();
+      }
+      cx += w; i++;
+    }
+  }
+  return cx;
+}
+// 眉标：小字从左滑入
+function eyebrow(c, s, y, lt, t0, th) { t0 = Math.max(-0.38, t0 - 0.25); const k = eOut((lt - t0) / 0.5); if (k <= 0) return; c.save(); c.globalAlpha *= k;
+  if (KAI) { const w = tw(c, s, F.sans(30, 600)) + 44; rr(c, SX - (1 - k) * 40, y - 28, w, 56, 28); c.fillStyle = th.hi; c.fill(); txt(c, s, SX + 22 - (1 - k) * 40, y + 1, F.sans(30, 600), "#fff"); }
+  else txt(c, s, SX - (1 - k) * 40, y, F.sans(34, 700), th.sub);
+  c.restore(); }
+// ───────── 通用组件（各片共用）─────────
+// fade 渐显进度；withA 带透明度画；pillW 标签宽；flow 标签自动换行排开；dashLine 虚线引线；ripple 外扩一圈的提示环
+const fade = (lt, t0, d = 0.3) => cl((lt - t0) / d);
+function withA(c, a, fn) { if (a <= 0) return; c.save(); c.globalAlpha *= Math.min(1, a); fn(); c.restore(); }
+const pillW = (c, s, size, icon) => tw(c, s, F.sans(size, 700)) + size * 1.3 + (icon ? size * 1.2 : 0);
+// 一串标签自动换行排开，返回每个标签的位置
+function flow(c, items, x0, y0, wmax, size, gap = 24, rowGap = 24) {
+  const h = size * 1.9; let x = x0, y = y0; const out = [];
+  items.forEach(s => { const w = pillW(c, s, size); if (x > x0 && x + w > x0 + wmax) { x = x0; y += h + rowGap; } out.push({ s, x, y, w }); x += w + gap; });
+  return out;
+}
+function dashLine(c, x1, y1, x2, y2, col, k = 1) {
+  if (k <= 0) return; c.save(); c.setLineDash([8, 10]); c.strokeStyle = col; c.lineWidth = 3; c.lineCap = "round";
+  c.beginPath(); c.moveTo(x1, y1); c.lineTo(lerp(x1, x2, k), lerp(y1, y2, k)); c.stroke(); c.restore();
+}
+function ripple(c, lt, t0, x, y, w, h, r, col = C.acc) {
+  const p = (lt - t0) / 0.7; if (p <= 0 || p >= 1) return; const e = eOut(p) * 30;
+  c.save(); c.globalAlpha *= 1 - p; c.lineWidth = 4; c.strokeStyle = col; rr(c, x - e, y - e, w + 2 * e, h + 2 * e, r + e * 0.6); c.stroke(); c.restore();
+}
+
+// ════════ 本片专属开始：主线交接坐标 + SCENES + TRANS（新片重写这一段，其余是引擎）════════
+const TRANS = [null, "dip"];
+const SCENES = {
+  intro(c, S, lt, th) {
+    eyebrow(c, "观察与比较", LY.ey, lt, 0, th);
+    TT(c, "让差异|{看得见}", lt, 0.05, th);
+    const box = LY.box;
+    const rows = [["甲", 0.48], ["乙", 0.82], ["丙", 0.62]];
+    rows.forEach(([label, ratio], i) => {
+      const y = box.y + box.h * (0.22 + i * 0.24);
+      txt(c, label, box.x, y, F.sans(36, 700), th.fg);
+      const width = (box.w - 112) * ratio * eOut((lt - 0.2 - i * 0.15) / 0.7);
+      if (width > 0) {
+        rr(c, box.x + 96, y - 25, width, 50, 16);
+        c.fillStyle = i === 1 ? th.hi : C.blueTint; c.fill();
+      }
+    });
+  },
+  end(c, S, lt, th) {
+    eyebrow(c, "下期见", LY.ey, lt, 0, th);
+    TT(c, "感谢|{观看}", lt, 0, th);
+    const box = LY.box;
+    const img = IMG.ip;
+    const h = Math.min(box.h * 0.56, box.w * 0.85 * img.height / img.width);
+    const cx = box.x + box.w / 2;
+    rise(c, ap(lt, 0.1), 40, () => drawSticker(c, cx, box.y + h, h));
+    const actions = [[iconThumb, "点赞"], [iconFlower, "推荐"], [iconRepost, "转发"]];
+    actions.forEach(([icon, label], i) => {
+      const x = box.x + box.w * (i + 0.5) / 3;
+      const y = box.y + box.h * 0.66;
+      withA(c, fade(lt, 0.35 + 0.12 * i), () => {
+        c.save(); c.translate(x - 46, y); c.scale(0.65, 0.65); icon(c, th.hi); c.restore();
+        txt(c, label, x - 18, y, F.sans(32, 700), th.fg);
+      });
+    });
+    const y = box.y + box.h * 0.87;
+    withA(c, fade(lt, 0.45), () => {
+      rr(c, box.x, y - 48, box.w, 96, 48);
+      c.fillStyle = C.acc; c.fill();
+      c.font = F.sans(40, 700); c.fillStyle = "#fff"; c.textAlign = "center";
+      c.textBaseline = "middle"; c.fillText(BRAND.outro || "关注" + BRAND.name, cx, y, box.w - 64);
+    });
+  },
+};
+// ════════ 本片专属到 TRANS 为止 ════════
+function drawSticker(c, x, y, h, sx = 1, sy = 1) {
+  const img = IMG.ip, w = h * img.width / img.height;
+  c.save(); c.translate(x, y); c.scale(sx, sy); c.drawImage(img, -w / 2, -h, w, h); c.restore();
+}
+// ───────── 扁平图标（三连页）─────────
+function iconThumb(c, col) {
+  c.fillStyle = col; rr(c, -30, -4, 13, 32, 4); c.fill();
+  c.beginPath(); c.moveTo(-12, 28); c.lineTo(15, 28); c.quadraticCurveTo(23, 28, 25, 20); c.lineTo(29, 0);
+  c.quadraticCurveTo(31, -9, 21, -9); c.lineTo(7, -9); c.lineTo(9, -21); c.quadraticCurveTo(10, -31, 1, -31);
+  c.quadraticCurveTo(-3, -31, -5, -26); c.lineTo(-12, -6); c.closePath(); c.fill();
+}
+function iconFlower(c, col) {
+  c.fillStyle = col;
+  for (let k = 0; k < 5; k++) { c.save(); c.rotate(-Math.PI / 2 + k * Math.PI * 2 / 5); c.beginPath(); c.ellipse(17, 0, 15, 11, 0, 0, Math.PI * 2); c.fill(); c.restore(); }
+  c.beginPath(); c.arc(0, 0, 9, 0, Math.PI * 2); c.fillStyle = C.amber; c.fill();
+}
+function iconRepost(c, col) {
+  c.strokeStyle = col; c.fillStyle = col; c.lineWidth = 6; c.lineCap = "round"; c.lineJoin = "round";
+  c.beginPath(); c.moveTo(-24, 8); c.lineTo(-24, -4); c.quadraticCurveTo(-24, -14, -14, -14); c.lineTo(16, -14); c.stroke();
+  c.beginPath(); c.moveTo(14, -24); c.lineTo(28, -14); c.lineTo(14, -4); c.closePath(); c.fill();
+  c.beginPath(); c.moveTo(24, -8); c.lineTo(24, 4); c.quadraticCurveTo(24, 14, 14, 14); c.lineTo(-16, 14); c.stroke();
+  c.beginPath(); c.moveTo(-14, 24); c.lineTo(-28, 14); c.lineTo(-14, 4); c.closePath(); c.fill();
+}
+
+// ───────── 转场：下标 = 入场场景序号 ─────────
+// up 连续上推 · push 横推 · zoom 镜头推进 · blur 模糊重排 · wipe 斜切色块（1 次）· dip 淡到纸底（1 次）
+// 深色段（time）前后保持 up，深浅纸底跟着整页推
+
+function xf(type, p, dir) {
+  const e = eIO(p), IN = dir === "in";
+  switch (type) {
+    case "push": return IN ? { dx: (1 - e) * W, a: 1 } : { dx: -e * W, a: 1 };
+    case "zoom": return IN ? { s: lerp(0.9, 1, eOut(p)), a: cl((p - 0.1) / 0.2) } : { s: lerp(1, 1.14, eIn(p)), a: 1 - eOut(p / 0.5) };
+    case "blur": return IN ? { s: lerp(1.04, 1, eOut(p)), blur: (1 - eOut(p)) * 10, a: cl((p - 0.15) / 0.25) } : { blur: eOut(p) * 14, a: 1 - eOut(p / 0.55) };
+    case "dip": return IN ? { dy: (1 - eOut(cl((p - 0.55) / 0.45))) * 40, a: cl((p - 0.55) / 0.3) } : { a: 1 - cl(p / 0.3) };
+    case "wipe": return { clip: IN ? "behind" : "ahead", a: 1 };
+    case "morph": return IN ? { a: 1 } : { a: 1 - eOut(p / 0.6) };
+    // iris：下一屏从内容中心一个圆里扩出来（圆边带一圈蓝色）；上一屏原地不动，被盖住
+    case "iris": return IN ? { iris: eIO(p), a: 1 } : { a: 1 - cl((p - 0.85) / 0.15) };
+    // shutter：下一屏像百叶窗一样一条条翻下来；上一屏原地不动
+    case "shutter": return IN ? { shutter: p, a: 1 } : { a: 1 - cl((p - 0.85) / 0.15) };
+    // dive：上一屏朝内容中心推进放大、加模糊、快速淡出；下一屏不动，主线物体照常交接
+    case "dive": return IN ? { a: 1 } : { s: 1 + 0.05 * eIn(p / 0.7), blur: eOut(p / 0.6) * 10, a: 1 - eOut(p / 0.6), o: [LY.box.x + LY.box.w / 2, LY.box.y + LY.box.h * 0.45] };
+    default: return IN ? { dy: (1 - e) * FLOW_DY, a: cl(p / 0.18) } : { dy: -e * FLOW_DY, a: 1 - eOut(p / 0.5) };
+  }
+}
+const WIPE_W = 420, WIPE_K = 0.3;
+const wipeLead = p => lerp(-H * WIPE_K - 40, W + WIPE_W + 40, eIO(p));
+const wipeX = (e, y) => e + (H - y) * WIPE_K;
+function wipeClip(c, p, side) {
+  const e = side === "ahead" ? wipeLead(p) : wipeLead(p) - WIPE_W, far = W + H * WIPE_K + 40;
+  c.beginPath();
+  if (side === "ahead") { c.moveTo(wipeX(e, -20), -20); c.lineTo(far, -20); c.lineTo(far, H + 20); c.lineTo(wipeX(e, H + 20), H + 20); }
+  else { c.moveTo(-far, -20); c.lineTo(wipeX(e, -20), -20); c.lineTo(wipeX(e, H + 20), H + 20); c.lineTo(-far, H + 20); }
+  c.closePath(); c.clip();
+}
+function drawWipeBand(p) {
+  const a = wipeLead(p), b = a - WIPE_W;
+  ctx.save(); ctx.beginPath();
+  ctx.moveTo(wipeX(b, -20), -20); ctx.lineTo(wipeX(a, -20), -20); ctx.lineTo(wipeX(a, H + 20), H + 20); ctx.lineTo(wipeX(b, H + 20), H + 20);
+  ctx.closePath(); ctx.fillStyle = C.acc; ctx.fill(); ctx.restore();
+}
+
+// ───────── 背景、字幕、头像 ─────────
+const BG_W = W + 44, BG_H = BG_W * 2760 / 1124;
+function bgOffset(t) { let o = 3 * t; for (let i = 1; i < B.length; i++) o += 36 * eIO((t - (B[i] - HALF)) / FLOW); return o; }
+function drawBg(t) {
+  const o = bgOffset(t);
+  ctx.drawImage(BASE_LIGHT ? IMG.bgL : IMG.bg, -22, -o, BG_W, BG_H);
+  SCN.forEach((S, i) => {
+    if (!S.light) return;
+    const pin = flowP(i, t), pout = i + 1 < SCN.length ? flowP(i + 1, t) : 0;
+    if (pin <= 0 || pout >= 1) return;
+    const y = (1 - eOut(pin)) * H - eOut(pout) * H;
+    ctx.save(); ctx.beginPath(); ctx.rect(0, y, W, H); ctx.clip(); ctx.drawImage(BASE_LIGHT ? IMG.bg : IMG.bgL, -22, -o, BG_W, BG_H); ctx.restore();
+  });
+}
+function lightAt(t, y) {
+  for (let i = 0; i < SCN.length; i++) {
+    if (!SCN[i].light) continue;
+    const pin = flowP(i, t), pout = i + 1 < SCN.length ? flowP(i + 1, t) : 0;
+    const top = (1 - eOut(pin)) * H - eOut(pout) * H;
+    if (pin > 0 && pout < 1 && y > top && y < top + H) return !BASE_LIGHT;
+  }
+  return BASE_LIGHT;
+}
+function drawSubs(t) {
+  const s = CUES.subs.find(s => t >= s.t0 && t < s.t1);
+  if (!s) return;
+  const a = cl((t - s.t0) / 0.08) * cl((s.t1 - t) / 0.06);
+  let size = CAP.size; ctx.font = F.sans(size, 700);
+  while (ctx.measureText(s.text).width + 64 > CAP.x1 - CAP.x0 && size > CAP.min) { size -= 1; ctx.font = F.sans(size, 700); }
+  const w = ctx.measureText(s.text).width + 64, h = CAP.h;
+  ctx.save(); ctx.globalAlpha = a;
+  rr(ctx, CAP.x0, CAP.y - h / 2, w, h, h / 2); ctx.fillStyle = lightAt(t, CAP.y) ? C.ink : "#2C2A30"; ctx.fill();
+  txt(ctx, s.text, CAP.x0 + 32, CAP.y + 1, F.sans(size, 700), "#FFFFFF");
+  ctx.restore();
+}
+// 头像：蓝色描边圆（与动效库一致）。assets/ip_face_wide.png 是从立绘裁的头肩像，嘴在 (x, y) 处（占图宽高的比例），s 是口型缩放
+const AVATAR_MOUTH = BRAND.mouth;
+function drawAvatar(t) {
+  const out = flowP(SCN.length - 1, t), a = cl((t - 0.35) / 0.2) * (1 - cl(out * 2));
+  if (a <= 0) return;
+  const s = spring(t - 0.35, 1.8, 6) * lerp(1, 0.8, out) * AV.r / 130, r = 130;
+  ctx.save(); ctx.globalAlpha = a; ctx.translate(AV.x, AV.y); ctx.scale(s, s);
+  ctx.save(); ctx.beginPath(); ctx.arc(0, 0, r, 0, 6.2832); ctx.clip(); ctx.fillStyle = "#E2EDFF"; ctx.fillRect(-r, -r, 2 * r, 2 * r); ctx.drawImage(IMG.avatar, -r, -r, 2 * r, 2 * r);
+  // 说话时嘴巴一张一合：口型大小跟配音音量走，再叠一个每秒约 5 次的开合
+  const mk = window.MOUTH ? MOUTH.v[Math.min(MOUTH.v.length - 1, Math.max(0, Math.round(t * MOUTH.fps)))] || 0 : 0;
+  const open = mk * (0.45 + 0.55 * Math.abs(Math.sin(t * Math.PI * 5.2)));
+  if (AVATAR_MOUTH && open > 0.05) {
+    // 头像用头肩构图，嘴在图里的位置和缩放见 AVATAR_MOUTH
+    const mx = (AVATAR_MOUTH.x * 2 - 1) * r, my = (AVATAR_MOUTH.y * 2 - 1) * r; ctx.save(); ctx.translate(mx, my); ctx.scale(AVATAR_MOUTH.s, AVATAR_MOUTH.s); ctx.translate(-mx, -my);
+    ctx.fillStyle = "#FDEBE8"; ctx.beginPath(); ctx.ellipse(mx, my, 17, 7, 0, 0, 6.2832); ctx.fill();
+    ctx.fillStyle = "#8A3F4A"; ctx.beginPath(); ctx.ellipse(mx, my + 2, 7 + 6 * open, 2 + 9 * open, 0, 0, 6.2832); ctx.fill();
+    ctx.save(); ctx.clip(); ctx.fillStyle = "#E58C96"; ctx.beginPath(); ctx.ellipse(mx, my + 4 + 9 * open, 6 + 4 * open, 3 + 4 * open, 0, 0, 6.2832); ctx.fill(); ctx.restore();
+    ctx.restore();
+  }
+  ctx.restore();
+  ctx.lineWidth = 2; ctx.strokeStyle = "#fff"; ctx.beginPath(); ctx.arc(0, 0, r + 1, 0, 6.2832); ctx.stroke();
+  ctx.lineWidth = 6; ctx.strokeStyle = C.acc; ctx.beginPath(); ctx.arc(0, 0, r - 3, 0, 6.2832); ctx.stroke();
+  ctx.restore();
+}
+
+// ───────── 主函数：纯函数逐帧 ─────────
+function seek(t) {
+  CUR_T = t;
+  ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+  ctx.globalAlpha = 1; ctx.filter = "none"; AK.ctx = ctx;
+  ctx.save();
+  // 转场整页冲击已取消
+  drawBg(t);
+  SCN.forEach((S, i) => {
+    const pin = i === 0 ? 1 : flowP(i, t), pout = i + 1 < SCN.length ? flowP(i + 1, t) : 0;
+    if (pin <= 0 || pout >= 1) return;
+    const fi = i > 0 && pin < 1 ? xf(TRANS[i], pin, "in") : { a: 1 };
+    const fo = pout > 0 ? xf(TRANS[i + 1], pout, "out") : { a: 1 };
+    const gate = 1;
+    const dx = (fi.dx || 0) + (fo.dx || 0), dy = (fi.dy || 0) + (fo.dy || 0);
+    const sc = (fi.s || 1) * (fo.s || 1), blur = (fi.blur || 0) + (fo.blur || 0), org = fo.o || fi.o || [W / 2, H * 0.42];
+    S._pout = pout;
+    ctx.save();
+    if (fi.clip) wipeClip(ctx, pin, fi.clip);
+    // 圆形扩散 / 百叶窗：先把下一屏要露出的区域裁出来，再铺一层纸底，盖住上一屏
+    if (fi.iris != null || fi.shutter != null) {
+      ctx.beginPath();
+      if (fi.iris != null) ctx.arc(LY.box.x + LY.box.w / 2, LY.box.y + LY.box.h * 0.4, fi.iris * Math.hypot(W, H), 0, 6.2832);
+      else { const n = 8, sh = H / n; for (let k = 0; k < n; k++) { const q = eIO(cl(fi.shutter * 1.7 - k * 0.09)); ctx.rect(0, k * sh, W, sh * q); } }
+      ctx.clip(); drawBg(t);
+    }
+    if (fo.clip) wipeClip(ctx, pout, fo.clip);
+    ctx.translate(org[0] + dx, org[1] + dy); ctx.scale(sc, sc); ctx.translate(-org[0], -org[1]);
+    CUR_OUT = S.key === "end" ? null : dur(S) - 0.42; CUR_DUR = dur(S);
+    if (blur > 0.3) ctx.filter = `blur(${(blur * SCALE).toFixed(2)}px)`;
+    ctx.globalAlpha = fi.a * fo.a * gate;
+    AK.ctx = ctx;
+    SCENES[S.key](ctx, S, L(S, t), theme(BASE_LIGHT !== !!S.light));
+    ctx.restore();
+  });
+  ctx.restore();
+  for (let i = 1; i < SCN.length; i++) { const p = flowP(i, t); if (TRANS[i] === "wipe" && p > 0 && p < 1) drawWipeBand(p);
+    if (TRANS[i] === "iris" && p > 0 && p < 1) { const r = eIO(p) * Math.hypot(W, H); ctx.save(); ctx.globalAlpha = 1 - p; ctx.lineWidth = 18; ctx.strokeStyle = C.acc; ctx.beginPath(); ctx.arc(LY.box.x + LY.box.w / 2, LY.box.y + LY.box.h * 0.4, r, 0, 6.2832); ctx.stroke(); ctx.restore(); } }
+  if (typeof drawRail === "function") drawRail(t);
+  drawSubs(t);
+  drawAvatar(t);
+}
+window.seek = seek;
+// 子帧运动模糊：?mb=6&fps=30，在快门时间内取 n 个子帧求平均
+const MB = +(new URLSearchParams(location.search).get("mb") || 0), FPSQ = +(new URLSearchParams(location.search).get("fps") || 30);
+const acc = document.createElement("canvas"); acc.width = cv.width; acc.height = cv.height; const actx = acc.getContext("2d");
+window.seekMB = t => {
+  if (MB < 2) return seek(t);
+  for (let k = 0; k < MB; k++) {
+    seek(t + (k / MB) * 0.5 / FPSQ);
+    actx.globalAlpha = 1 / (k + 1); actx.drawImage(cv, 0, 0);
+  }
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.globalAlpha = 1; ctx.filter = "none"; ctx.drawImage(acc, 0, 0);
+};
+
+window.TOTAL = TOTAL;
+
+async function boot() {
+  if (KAI && !(await document.fonts.load('500 30px "LXGW WenKai"', '示例')).length)
+    throw new Error("请先安装霞鹜文楷，再预览文楷版");
+
+  await Promise.all(Object.entries(IMGS).map(([k, s]) => new Promise((res, rej) => {
+    const i = new Image(); i.onload = () => { IMG[k] = i; res(); }; i.onerror = () => rej(new Error(s)); i.src = s;
+  })));
+  const all = CUES.allText + document.getElementById("main").textContent;
+  await Promise.allSettled([500, 700, 900].map(w => document.fonts.load(`${w} 30px MiSans, "PingFang SC", "Microsoft YaHei", sans-serif`, all)).concat([document.fonts.load(F.num(100), "0123456789")]));
+  await document.fonts.ready;
+  seek(0);
+  window.READY = true;
+}
+if (new URLSearchParams(location.search).has("render")) document.body.classList.add("render");
+boot().catch(e => { window.__err = String(e); }).then(() => {
+  if (document.body.classList.contains("render")) return;
+  const au = document.getElementById("au"), sc = document.getElementById("scrub"), tc = document.getElementById("tc");
+  sc.max = TOTAL;
+  let playing = false;
+  const tick = () => { if (!playing) return; const t = au.currentTime; seek(t); sc.value = t; tc.textContent = t.toFixed(2); if (t >= TOTAL) playing = false; requestAnimationFrame(tick); };
+  document.getElementById("play").onclick = () => { playing = !playing; if (playing) { au.currentTime = +sc.value; au.play(); tick(); } else au.pause(); };
+  sc.oninput = () => { au.currentTime = +sc.value; seek(+sc.value); tc.textContent = (+sc.value).toFixed(2); };
+});
+</script>
+</body>
+</html>

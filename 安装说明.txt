@@ -1,0 +1,13 @@
+azhen blue mg video
+
+对话安装
+把整个 ZIP 发给 Codex，附上这句话：
+请安装 azhen-blue-mg-video。安装好后立即读取它的 SKILL.md，按“首次安装与换角色”开始问我。
+
+终端安装
+解压后在本目录运行 python3 install.py。它会复制 Skill，随后询问你的称呼和 IP 三视图路径。也可以回到对话上传图片。
+
+手动安装
+把 azhen-blue-mg-video 整个文件夹放入 Codex 的 skills 目录。开启新对话，说“初始化azhen blue mg video”，即可开始设置。
+
+三视图需要同一角色的正面、侧面、背面。支持 PNG、JPEG、WebP。一张合图或在对话里分开发三张都可以。以后说“换称呼”或“换 IP”即可更新。
